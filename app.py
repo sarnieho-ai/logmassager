@@ -3,6 +3,12 @@ AI-Powered Log Harmonizer & Regex Generator
 =============================================
 A Streamlit app that transforms unstructured text logs into structured
 JSON/CSV data and generates reusable SIEM parsing rules (Regex/Grok/KQL).
+
+Performance optimizations:
+- Concurrent API calls (ThreadPoolExecutor)
+- Batch multiple clusters into single prompts
+- Optional fast model (Haiku) for bulk parsing
+- Result caching to avoid redundant API calls
 """
 
 import streamlit as st
@@ -13,6 +19,7 @@ import io
 import hashlib
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Generator
 
@@ -52,6 +59,31 @@ You are a Security Data Engineer. Given a raw log line:
 }
 </system_prompt>"""
 
+BATCH_SYSTEM_PROMPT = """<system_prompt>
+You are a Security Data Engineer. You will receive MULTIPLE log pattern groups.
+For EACH group, extract fields, normalize timestamps to ISO-8601, and generate a PCRE regex.
+
+Output ONLY a valid JSON array — no markdown, no explanation. Each element must follow this schema:
+{
+  "group_id": "the group ID provided",
+  "parsed_data": {
+    "timestamp": "ISO-8601 or null",
+    "source": "source system or null",
+    "event_id": "event id or null",
+    "severity": "severity level or null",
+    "message": "cleaned message text",
+    "additional_fields": {}
+  },
+  "generated_regex": "^(?P<timestamp>...) ...",
+  "confidence_score": 0.95
+}
+</system_prompt>"""
+
+MODELS = {
+    "Haiku (fast, cheap)": "claude-haiku-4-5-20241022",
+    "Sonnet (balanced)": "claude-sonnet-4-20250514",
+}
+
 SIEM_FORMATS = {
     "Splunk (Regex)": "regex",
     "Elastic (Grok)": "grok",
@@ -63,7 +95,6 @@ IP_PATTERN = re.compile(
     r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
 )
 EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
-# Common username patterns like "user=admin" or "User: jdoe"
 # Uses a capturing group instead of variable-width lookbehind for Python 3.13 compat
 USERNAME_PATTERN = re.compile(
     r"(?:[Uu]ser(?:name)?[=: ]+)([\w.\-\\]+)"
@@ -120,7 +151,6 @@ def _tokenize(line: str) -> list[str]:
     tokens = line.strip().split()
     normalized: list[str] = []
     for t in tokens:
-        # Replace things that look like variables with a wildcard
         if re.fullmatch(r"\d+", t):
             normalized.append("<NUM>")
         elif re.fullmatch(r"[\da-fA-F]{8,}", t):
@@ -178,24 +208,50 @@ def stream_lines(uploaded_file, chunk_size: int = 1024 * 64) -> Generator[str, N
 
 
 # =========================================================================
-# 4. AI INTEGRATION  (Anthropic Claude via REST)
+# 4. AI INTEGRATION  (Anthropic Claude — optimized)
 # =========================================================================
-def call_claude(api_key: str, sample_lines: list[str], siem_format: str) -> dict | None:
-    """Send sample log lines to Claude and return structured JSON."""
+def _get_client(api_key: str):
+    """Return an Anthropic client."""
     import anthropic
+    return anthropic.Anthropic(api_key=api_key)
 
-    client = anthropic.Anthropic(api_key=api_key)
 
+def _parse_json_response(text: str) -> dict | list | None:
+    """Extract JSON from an AI response, handling markdown fences etc."""
+    text = text.strip()
+    # Try markdown fences first
+    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if json_match:
+        text = json_match.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Find outermost JSON structure
+    for opener, closer in [("[", "]"), ("{", "}")]:
+        try:
+            start = text.index(opener)
+            end = text.rindex(closer) + 1
+            return json.loads(text[start:end])
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def call_claude_single(
+    client, model: str, sample_lines: list[str], siem_format: str
+) -> dict | None:
+    """Send a single cluster's samples to Claude. Used for concurrent calls."""
     siem_extra = ""
     if siem_format == "grok":
         siem_extra = (
             "\nAdditionally, convert the PCRE regex into an Elastic Grok pattern "
-            "and include it as \"grok_pattern\" in your JSON output."
+            'and include it as "grok_pattern" in your JSON output.'
         )
     elif siem_format == "kql":
         siem_extra = (
             "\nAdditionally, generate a Microsoft Sentinel KQL parse statement "
-            "and include it as \"kql_parse\" in your JSON output."
+            'and include it as "kql_parse" in your JSON output.'
         )
 
     user_message = (
@@ -209,41 +265,183 @@ def call_claude(api_key: str, sample_lines: list[str], siem_format: str) -> dict
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=model,
             max_tokens=2048,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
-        text = response.content[0].text.strip()
-
-        # Try to extract JSON from the response (handle markdown fences)
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if json_match:
-            text = json_match.group(1).strip()
-
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Attempt lenient extraction
-        try:
-            start = text.index("{")
-            end = text.rindex("}") + 1
-            return json.loads(text[start:end])
-        except Exception:
-            return None
-    except Exception as e:
-        st.error(f"API error: {e}")
+        return _parse_json_response(response.content[0].text)
+    except Exception:
         return None
 
 
+def call_claude_batch(
+    client,
+    model: str,
+    batch: list[tuple[str, list[str]]],
+    siem_format: str,
+) -> dict[str, dict | None]:
+    """Send multiple clusters in ONE API call. Returns {group_id: result}."""
+    siem_extra = ""
+    if siem_format == "grok":
+        siem_extra = '\nFor each group, also include a "grok_pattern" field.'
+    elif siem_format == "kql":
+        siem_extra = '\nFor each group, also include a "kql_parse" field.'
+
+    groups_text = ""
+    for group_id, samples in batch:
+        groups_text += f"\n--- GROUP {group_id} ---\n" + "\n".join(samples) + "\n"
+
+    user_message = (
+        f"Analyze each group of log samples below. Return a JSON array with one "
+        f"object per group.{siem_extra}\n{groups_text}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=BATCH_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        parsed = _parse_json_response(response.content[0].text)
+        if isinstance(parsed, list):
+            return {item["group_id"]: item for item in parsed if "group_id" in item}
+        elif isinstance(parsed, dict) and "group_id" in parsed:
+            return {parsed["group_id"]: parsed}
+    except Exception:
+        pass
+    return {}
+
+
 # =========================================================================
-# 5. SIEM FORMAT CONVERTERS
+# 5. CONCURRENT + BATCHED PROCESSING ENGINE
+# =========================================================================
+def process_clusters(
+    api_key: str,
+    clusters: dict[str, list[str]],
+    siem_format: str,
+    model: str,
+    samples_per_cluster: int,
+    anonymize: bool,
+    max_workers: int,
+    batch_size: int,
+    progress_callback=None,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Process all clusters with concurrency and optional batching.
+    Returns (results_rows, regex_manifest).
+    """
+    client = _get_client(api_key)
+    cluster_items = list(clusters.items())
+    total = len(cluster_items)
+
+    # --- Prepare samples (anonymize if needed) ---
+    prepared: list[tuple[str, list[str], dict]] = []  # (fp, samples, anon_mapping)
+    for fp, lines in cluster_items:
+        samples = lines[:samples_per_cluster]
+        anon_mapping: dict = {}
+        if anonymize:
+            anon_samples, combined = [], {}
+            for s in samples:
+                masked, mapping = anonymize_line(s)
+                anon_samples.append(masked)
+                combined.update(mapping)
+            samples = anon_samples
+            anon_mapping = combined
+        prepared.append((fp, samples, anon_mapping))
+
+    # --- Decide strategy: batch or concurrent singles ---
+    ai_results: dict[str, dict | None] = {}
+    completed = 0
+
+    if batch_size > 1 and total > 1:
+        # ---- BATCHED MODE: group clusters into batches, run batches concurrently ----
+        batches: list[list[tuple[str, list[str], dict]]] = []
+        for i in range(0, len(prepared), batch_size):
+            batches.append(prepared[i : i + batch_size])
+
+        def _run_batch(batch_items):
+            batch_input = [(fp[:12], samples) for fp, samples, _ in batch_items]
+            return call_claude_batch(client, model, batch_input, siem_format), batch_items
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_batch, b): b for b in batches}
+            for future in as_completed(futures):
+                batch_result, batch_items = future.result()
+                for fp, samples, anon_mapping in batch_items:
+                    key = fp[:12]
+                    result = batch_result.get(key)
+                    if result and anonymize and anon_mapping:
+                        result = deanonymize_result(result, anon_mapping)
+                    ai_results[fp] = result
+                    completed += 1
+                if progress_callback:
+                    progress_callback(min(completed, total), total)
+    else:
+        # ---- CONCURRENT SINGLES MODE ----
+        def _run_single(item):
+            fp, samples, anon_mapping = item
+            result = call_claude_single(client, model, samples, siem_format)
+            if result and anonymize and anon_mapping:
+                result = deanonymize_result(result, anon_mapping)
+            return fp, result
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_run_single, p): p for p in prepared}
+            for future in as_completed(futures):
+                fp, result = future.result()
+                ai_results[fp] = result
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, total)
+
+    # --- Aggregate results ---
+    results: list[dict] = []
+    regex_manifest: list[dict] = []
+
+    for fp, lines in cluster_items:
+        ai_result = ai_results.get(fp)
+        if ai_result is None:
+            continue
+
+        raw_regex = ai_result.get("generated_regex", "")
+        manifest_entry: dict = {
+            "cluster_id": fp[:12],
+            "sample_count": len(lines),
+            "regex": raw_regex,
+            "confidence": ai_result.get("confidence_score", 0),
+        }
+        if siem_format == "grok":
+            manifest_entry["grok_pattern"] = ai_result.get(
+                "grok_pattern", regex_to_grok(raw_regex)
+            )
+        elif siem_format == "kql":
+            fields = list((ai_result.get("parsed_data") or {}).keys())
+            manifest_entry["kql_parse"] = ai_result.get(
+                "kql_parse", regex_to_kql(raw_regex, fields)
+            )
+        regex_manifest.append(manifest_entry)
+
+        parsed = ai_result.get("parsed_data", {})
+        for line in lines:
+            row = flatten_parsed(parsed)
+            row["_raw"] = line
+            row["_cluster_id"] = fp[:12]
+            row["_confidence"] = ai_result.get("confidence_score", 0)
+            results.append(row)
+
+    return results, regex_manifest
+
+
+# =========================================================================
+# 6. SIEM FORMAT CONVERTERS
 # =========================================================================
 def regex_to_grok(regex: str) -> str:
     """Best-effort conversion of a named-group PCRE regex to Grok syntax."""
     def _replace(m: re.Match) -> str:
         name = m.group(1)
         pattern = m.group(2)
-        # Map common sub-patterns to Grok types
         grok_type = "DATA"
         if "\\d" in pattern or pattern in (r"\d+", r"[0-9]+"):
             grok_type = "INT"
@@ -259,11 +457,11 @@ def regex_to_grok(regex: str) -> str:
 def regex_to_kql(regex: str, fields: list[str]) -> str:
     """Generate a minimal KQL parse statement from regex field names."""
     placeholders = " ".join(f"*{f}:string*" for f in fields)
-    return f'| parse RawLog with {placeholders}  // Adjust delimiters to match your data'
+    return f"| parse RawLog with {placeholders}  // Adjust delimiters to match your data"
 
 
 # =========================================================================
-# 6. RESULT AGGREGATION
+# 7. RESULT AGGREGATION
 # =========================================================================
 def flatten_parsed(parsed_data: dict) -> dict:
     """Flatten nested parsed_data into a single-level dict for DataFrame."""
@@ -278,19 +476,30 @@ def flatten_parsed(parsed_data: dict) -> dict:
 
 
 # =========================================================================
-# 7. STREAMLIT UI
+# 8. STREAMLIT UI
 # =========================================================================
 def main():
     # -- Sidebar -------------------------------------------------------
     with st.sidebar:
-        st.image("https://img.icons8.com/fluency/96/parse-from-clipboard.png", width=60)
+        st.image(
+            "https://img.icons8.com/fluency/96/parse-from-clipboard.png", width=60
+        )
         st.title("⚙️ Settings")
 
         api_key = st.text_input(
             "Anthropic API Key",
             type="password",
-            help="Your Claude API key. Required for AI parsing.",
+            value=st.secrets.get("ANTHROPIC_API_KEY", ""),
+            help="Your Claude API key. Set in Streamlit secrets or paste here.",
         )
+
+        model_choice = st.selectbox(
+            "AI Model",
+            options=list(MODELS.keys()),
+            index=0,
+            help="Haiku = ~3x faster & cheaper. Sonnet = higher accuracy.",
+        )
+        model = MODELS[model_choice]
 
         siem_choice = st.selectbox(
             "SIEM Output Format",
@@ -305,12 +514,31 @@ def main():
             help="Mask IPs, emails, and usernames before sending to AI.",
         )
 
+        st.divider()
+        st.markdown("**⚡ Performance**")
+
         samples_per_cluster = st.slider(
-            "Samples per pattern cluster",
+            "Samples per cluster",
             min_value=1,
             max_value=5,
             value=2,
-            help="How many example lines per cluster to send to the AI.",
+            help="Lines per cluster sent to the AI.",
+        )
+
+        max_workers = st.slider(
+            "Parallel workers",
+            min_value=1,
+            max_value=8,
+            value=4,
+            help="Concurrent API calls. Higher = faster but may hit rate limits.",
+        )
+
+        batch_size = st.slider(
+            "Clusters per API call",
+            min_value=1,
+            max_value=10,
+            value=5,
+            help="Batch multiple clusters into one prompt. Reduces total API calls.",
         )
 
         st.divider()
@@ -335,7 +563,9 @@ def main():
         st.stop()
 
     if not api_key:
-        st.warning("Please enter your Anthropic API key in the sidebar to enable AI parsing.")
+        st.warning(
+            "Please enter your Anthropic API key in the sidebar to enable AI parsing."
+        )
         st.stop()
 
     # -- Ingest & Cluster -----------------------------------------------
@@ -347,99 +577,58 @@ def main():
         all_lines.extend(lines)
         file_sources[uf.name] = lines
 
-    st.success(f"Loaded **{len(all_lines):,}** lines from **{len(uploaded_files)}** file(s).")
+    st.success(
+        f"Loaded **{len(all_lines):,}** lines from **{len(uploaded_files)}** file(s)."
+    )
 
     with st.expander("📄 Raw log preview (first 20 lines)", expanded=False):
         st.code("\n".join(all_lines[:20]), language="log")
 
     clusters = cluster_logs(all_lines)
-    st.info(f"Identified **{len(clusters)}** unique log pattern(s) via fingerprinting.")
+    n_clusters = len(clusters)
+    n_api_calls = max(1, -(-n_clusters // batch_size))  # ceil division
+    st.info(
+        f"Identified **{n_clusters}** unique log pattern(s) — "
+        f"will make ~**{n_api_calls}** API call(s) "
+        f"with **{max_workers}** parallel workers."
+    )
 
     # -- Process Button -------------------------------------------------
     if st.button("🚀 Harmonize Logs", type="primary", use_container_width=True):
-        results: list[dict] = []
-        regex_manifest: list[dict] = []
         progress = st.progress(0, text="Processing clusters…")
+        start_time = time.time()
 
-        cluster_items = list(clusters.items())
-        total = len(cluster_items)
-
-        for idx, (fp, lines) in enumerate(cluster_items):
+        def _update(done, total):
             progress.progress(
-                (idx + 1) / total,
-                text=f"Processing cluster {idx + 1}/{total} ({len(lines)} lines)…",
+                done / total, text=f"Processing {done}/{total} clusters…"
             )
 
-            # Pick representative samples
-            samples = lines[: samples_per_cluster]
+        results, regex_manifest = process_clusters(
+            api_key=api_key,
+            clusters=clusters,
+            siem_format=siem_format,
+            model=model,
+            samples_per_cluster=samples_per_cluster,
+            anonymize=anonymize,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            progress_callback=_update,
+        )
 
-            # Anonymize if enabled
-            anon_mapping: dict = {}
-            if anonymize:
-                anon_samples = []
-                combined_mapping: dict = {}
-                for s in samples:
-                    masked, mapping = anonymize_line(s)
-                    anon_samples.append(masked)
-                    combined_mapping.update(mapping)
-                samples = anon_samples
-                anon_mapping = combined_mapping
-
-            # Call AI
-            ai_result = call_claude(api_key, samples, siem_format)
-            if ai_result is None:
-                st.warning(f"⚠️ Cluster {fp[:8]}… returned no valid JSON. Skipping.")
-                continue
-
-            # De-anonymize
-            if anonymize and anon_mapping:
-                ai_result = deanonymize_result(ai_result, anon_mapping)
-
-            # Build regex manifest entry
-            manifest_entry: dict = {
-                "cluster_id": fp[:12],
-                "sample_count": len(lines),
-                "regex": ai_result.get("generated_regex", ""),
-                "confidence": ai_result.get("confidence_score", 0),
-            }
-
-            # Add SIEM-specific fields
-            raw_regex = ai_result.get("generated_regex", "")
-            if siem_format == "grok":
-                manifest_entry["grok_pattern"] = ai_result.get(
-                    "grok_pattern", regex_to_grok(raw_regex)
-                )
-            elif siem_format == "kql":
-                fields = list((ai_result.get("parsed_data") or {}).keys())
-                manifest_entry["kql_parse"] = ai_result.get(
-                    "kql_parse", regex_to_kql(raw_regex, fields)
-                )
-
-            regex_manifest.append(manifest_entry)
-
-            # Expand result to all lines in the cluster
-            parsed = ai_result.get("parsed_data", {})
-            for line in lines:
-                row = flatten_parsed(parsed)
-                row["_raw"] = line
-                row["_cluster_id"] = fp[:12]
-                row["_confidence"] = ai_result.get("confidence_score", 0)
-                results.append(row)
-
-            # Be kind to rate limits
-            if idx < total - 1:
-                time.sleep(0.3)
-
+        elapsed = time.time() - start_time
         progress.empty()
 
         if not results:
             st.error("No results were produced. Check your API key and log format.")
             st.stop()
 
+        st.toast(f"Done in {elapsed:.1f}s", icon="⚡")
+
         # Store in session
         st.session_state["results"] = results
         st.session_state["regex_manifest"] = regex_manifest
         st.session_state["siem_format"] = siem_format
+        st.session_state["elapsed"] = elapsed
         st.rerun()
 
     # -- Display Results ------------------------------------------------
@@ -449,8 +638,14 @@ def main():
     results = st.session_state["results"]
     regex_manifest = st.session_state["regex_manifest"]
     siem_format = st.session_state.get("siem_format", "regex")
+    elapsed = st.session_state.get("elapsed", 0)
 
     st.divider()
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Parsed Lines", f"{len(results):,}")
+    col_m2.metric("Pattern Classes", len(regex_manifest))
+    col_m3.metric("Processing Time", f"{elapsed:.1f}s")
+
     st.subheader("📊 Parsed Results")
 
     df = pd.DataFrame(results)
@@ -534,4 +729,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
