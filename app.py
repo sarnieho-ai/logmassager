@@ -80,7 +80,7 @@ Output ONLY a valid JSON array — no markdown, no explanation. Each element mus
 </system_prompt>"""
 
 MODELS = {
-    "Haiku 3.5 (fast, cheap)": "claude-3-5-haiku-20241022",
+    "Haiku 4.5 (fast, cheap)": "claude-haiku-4-5-20251001",
     "Sonnet 4 (balanced)": "claude-sonnet-4-20250514",
 }
 
