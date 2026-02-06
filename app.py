@@ -593,6 +593,18 @@ def main():
         all_lines.extend(lines)
         file_sources[uf.name] = lines
 
+    # Detect file changes and clear stale results
+    file_sig = hashlib.md5(
+        "|".join(sorted(file_sources.keys())).encode()
+        + str(len(all_lines)).encode()
+    ).hexdigest()
+    if st.session_state.get("_file_sig") != file_sig:
+        st.session_state.pop("results", None)
+        st.session_state.pop("regex_manifest", None)
+        st.session_state.pop("siem_format", None)
+        st.session_state.pop("elapsed", None)
+        st.session_state["_file_sig"] = file_sig
+
     st.success(
         f"Loaded **{len(all_lines):,}** lines from **{len(uploaded_files)}** file(s)."
     )
