@@ -80,8 +80,8 @@ Output ONLY a valid JSON array — no markdown, no explanation. Each element mus
 </system_prompt>"""
 
 MODELS = {
-    "Haiku (fast, cheap)": "claude-haiku-4-5-20241022",
-    "Sonnet (balanced)": "claude-sonnet-4-20250514",
+    "Haiku 3.5 (fast, cheap)": "claude-3-5-haiku-20241022",
+    "Sonnet 4 (balanced)": "claude-sonnet-4-20250514",
 }
 
 SIEM_FORMATS = {
@@ -749,4 +749,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
