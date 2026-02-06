@@ -240,8 +240,8 @@ def _parse_json_response(text: str) -> dict | list | None:
 
 def call_claude_single(
     client, model: str, sample_lines: list[str], siem_format: str
-) -> dict | None:
-    """Send a single cluster's samples to Claude. Used for concurrent calls."""
+) -> tuple[dict | None, str | None]:
+    """Send a single cluster's samples to Claude. Returns (result, error_msg)."""
     siem_extra = ""
     if siem_format == "grok":
         siem_extra = (
@@ -270,10 +270,13 @@ def call_claude_single(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
-        return _parse_json_response(response.content[0].text)
+        raw_text = response.content[0].text
+        parsed = _parse_json_response(raw_text)
+        if parsed is None:
+            return None, f"JSON parse failed. Raw response: {raw_text[:300]}"
+        return parsed, None
     except Exception as e:
-        st.error(f"API call failed: {type(e).__name__}: {e}")
-        return None
+        return None, f"{type(e).__name__}: {e}"
 
 
 def call_claude_batch(
@@ -281,8 +284,8 @@ def call_claude_batch(
     model: str,
     batch: list[tuple[str, list[str]]],
     siem_format: str,
-) -> dict[str, dict | None]:
-    """Send multiple clusters in ONE API call. Returns {group_id: result}."""
+) -> tuple[dict[str, dict | None], str | None]:
+    """Send multiple clusters in ONE API call. Returns ({group_id: result}, error_msg)."""
     siem_extra = ""
     if siem_format == "grok":
         siem_extra = '\nFor each group, also include a "grok_pattern" field.'
@@ -305,14 +308,15 @@ def call_claude_batch(
             system=BATCH_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
-        parsed = _parse_json_response(response.content[0].text)
+        raw_text = response.content[0].text
+        parsed = _parse_json_response(raw_text)
         if isinstance(parsed, list):
-            return {item["group_id"]: item for item in parsed if "group_id" in item}
+            return {item["group_id"]: item for item in parsed if "group_id" in item}, None
         elif isinstance(parsed, dict) and "group_id" in parsed:
-            return {parsed["group_id"]: parsed}
+            return {parsed["group_id"]: parsed}, None
+        return {}, f"Unexpected response format. Raw: {raw_text[:300]}"
     except Exception as e:
-        st.error(f"Batch API call failed: {type(e).__name__}: {e}")
-    return {}
+        return {}, f"{type(e).__name__}: {e}"
 
 
 # =========================================================================
@@ -328,10 +332,10 @@ def process_clusters(
     max_workers: int,
     batch_size: int,
     progress_callback=None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[str]]:
     """
     Process all clusters with concurrency and optional batching.
-    Returns (results_rows, regex_manifest).
+    Returns (results_rows, regex_manifest, errors).
     """
     client = _get_client(api_key)
     cluster_items = list(clusters.items())
@@ -365,13 +369,16 @@ def process_clusters(
 
         def _run_batch(batch_items):
             batch_input = [(fp[:12], samples) for fp, samples, _ in batch_items]
-            return call_claude_batch(client, model, batch_input, siem_format), batch_items
+            result_dict, err = call_claude_batch(client, model, batch_input, siem_format)
+            return result_dict, batch_items, err
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_run_batch, b): b for b in batches}
             for future in as_completed(futures):
                 try:
-                    batch_result, batch_items = future.result()
+                    batch_result, batch_items, err = future.result()
+                    if err:
+                        errors.append(f"Batch error: {err}")
                     for fp, samples, anon_mapping in batch_items:
                         key = fp[:12]
                         result = batch_result.get(key)
@@ -387,26 +394,24 @@ def process_clusters(
         # ---- CONCURRENT SINGLES MODE ----
         def _run_single(item):
             fp, samples, anon_mapping = item
-            result = call_claude_single(client, model, samples, siem_format)
+            result, err = call_claude_single(client, model, samples, siem_format)
             if result and anonymize and anon_mapping:
                 result = deanonymize_result(result, anon_mapping)
-            return fp, result
+            return fp, result, err
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_run_single, p): p for p in prepared}
             for future in as_completed(futures):
                 try:
-                    fp, result = future.result()
+                    fp, result, err = future.result()
+                    if err:
+                        errors.append(f"Cluster {fp[:8]}: {err}")
                     ai_results[fp] = result
                     completed += 1
                 except Exception as e:
                     errors.append(f"Thread error: {type(e).__name__}: {e}")
                 if progress_callback:
                     progress_callback(min(max(completed, 1), total), total)
-
-    # Surface any errors that occurred
-    for err in errors:
-        st.error(err)
 
     # --- Aggregate results ---
     results: list[dict] = []
@@ -443,7 +448,7 @@ def process_clusters(
             row["_confidence"] = ai_result.get("confidence_score", 0)
             results.append(row)
 
-    return results, regex_manifest
+    return results, regex_manifest, errors
 
 
 # =========================================================================
@@ -614,7 +619,7 @@ def main():
                 done / total, text=f"Processing {done}/{total} clusters…"
             )
 
-        results, regex_manifest = process_clusters(
+        results, regex_manifest, proc_errors = process_clusters(
             api_key=api_key,
             clusters=clusters,
             siem_format=siem_format,
@@ -628,6 +633,10 @@ def main():
 
         elapsed = time.time() - start_time
         progress.empty()
+
+        # Show any errors that occurred during processing
+        for err in proc_errors:
+            st.error(err)
 
         if not results:
             st.error("No results were produced. Check your API key and log format.")
@@ -740,3 +749,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
