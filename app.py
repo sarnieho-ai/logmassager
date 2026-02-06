@@ -486,12 +486,7 @@ def main():
         )
         st.title("⚙️ Settings")
 
-        api_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            value=st.secrets.get("ANTHROPIC_API_KEY", ""),
-            help="Your Claude API key. Set in Streamlit secrets or paste here.",
-        )
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 
         model_choice = st.selectbox(
             "AI Model",
@@ -564,7 +559,8 @@ def main():
 
     if not api_key:
         st.warning(
-            "Please enter your Anthropic API key in the sidebar to enable AI parsing."
+            "API key not found. Add `ANTHROPIC_API_KEY` to your Streamlit secrets "
+            "(Settings → Secrets)."
         )
         st.stop()
 
