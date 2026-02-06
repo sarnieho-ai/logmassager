@@ -88,6 +88,7 @@ SIEM_FORMATS = {
     "Splunk (Regex)": "regex",
     "Elastic (Grok)": "grok",
     "Sentinel (KQL)": "kql",
+    "FortiSIEM (XML Parser)": "fortisiem",
 }
 
 # Patterns used by the anonymization mode
@@ -253,6 +254,12 @@ def call_claude_single(
             "\nAdditionally, generate a Microsoft Sentinel KQL parse statement "
             'and include it as "kql_parse" in your JSON output.'
         )
+    elif siem_format == "fortisiem":
+        siem_extra = (
+            "\nAdditionally, generate a FortiSIEM XML parser pattern using "
+            "<patternDefinitions> and <parsingInstructions> blocks. "
+            'Include it as "fortisiem_parser" in your JSON output.'
+        )
 
     user_message = (
         "Analyze the following raw log sample(s). For each unique format you see, "
@@ -291,6 +298,8 @@ def call_claude_batch(
         siem_extra = '\nFor each group, also include a "grok_pattern" field.'
     elif siem_format == "kql":
         siem_extra = '\nFor each group, also include a "kql_parse" field.'
+    elif siem_format == "fortisiem":
+        siem_extra = '\nFor each group, also include a "fortisiem_parser" field with a FortiSIEM XML parser pattern.'
 
     groups_text = ""
     for group_id, samples in batch:
@@ -438,6 +447,11 @@ def process_clusters(
             manifest_entry["kql_parse"] = ai_result.get(
                 "kql_parse", regex_to_kql(raw_regex, fields)
             )
+        elif siem_format == "fortisiem":
+            fields = list((ai_result.get("parsed_data") or {}).keys())
+            manifest_entry["fortisiem_parser"] = ai_result.get(
+                "fortisiem_parser", regex_to_fortisiem(raw_regex, fields)
+            )
         regex_manifest.append(manifest_entry)
 
         parsed = ai_result.get("parsed_data", {})
@@ -475,6 +489,63 @@ def regex_to_kql(regex: str, fields: list[str]) -> str:
     """Generate a minimal KQL parse statement from regex field names."""
     placeholders = " ".join(f"*{f}:string*" for f in fields)
     return f"| parse RawLog with {placeholders}  // Adjust delimiters to match your data"
+
+
+def regex_to_fortisiem(regex: str, fields: list[str]) -> str:
+    """Generate a FortiSIEM XML parser snippet from regex named groups."""
+    # Map common field names to FortiSIEM event attributes
+    forti_attr_map = {
+        "timestamp": "deviceTime",
+        "source": "reportingIP",
+        "src_ip": "srcIpAddr",
+        "dst_ip": "destIpAddr",
+        "src_port": "srcIpPort",
+        "dst_port": "destIpPort",
+        "event_id": "eventType",
+        "severity": "eventSeverity",
+        "message": "rawEventMsg",
+        "user": "user",
+        "username": "user",
+        "action": "eventAction",
+        "protocol": "ipProto",
+        "hostname": "hostName",
+        "process": "procName",
+        "pid": "procId",
+    }
+
+    # Build pattern definitions
+    pattern_defs = []
+    for f in fields:
+        if f == "additional_fields":
+            continue
+        forti_attr = forti_attr_map.get(f.lower(), f)
+        pattern_defs.append(
+            f'    <pattern name="pat_{f}" list="">'
+            f'<![CDATA[<:gPatStr>]]></pattern>'
+        )
+
+    # Build parsing instructions
+    parse_rules = []
+    for f in fields:
+        if f == "additional_fields":
+            continue
+        forti_attr = forti_attr_map.get(f.lower(), f)
+        parse_rules.append(
+            f'    <fieldMapping attr="{forti_attr}" '
+            f'pattern="pat_{f}" group="1"/>'
+        )
+
+    xml = (
+        '<eventParser name="Custom-LogHarmonizer">\n'
+        '  <patternDefinitions>\n'
+        + "\n".join(pattern_defs) + "\n"
+        '  </patternDefinitions>\n'
+        '  <parsingInstructions>\n'
+        + "\n".join(parse_rules) + "\n"
+        '  </parsingInstructions>\n'
+        '</eventParser>'
+    )
+    return xml
 
 
 # =========================================================================
@@ -720,6 +791,9 @@ def main():
             if "kql_parse" in entry:
                 st.markdown("**KQL Parse**")
                 st.code(entry["kql_parse"], language="kql")
+            if "fortisiem_parser" in entry:
+                st.markdown("**FortiSIEM Parser**")
+                st.code(entry["fortisiem_parser"], language="xml")
 
     # -- Exports --------------------------------------------------------
     st.divider()
