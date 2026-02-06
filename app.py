@@ -64,8 +64,9 @@ IP_PATTERN = re.compile(
 )
 EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 # Common username patterns like "user=admin" or "User: jdoe"
+# Uses a capturing group instead of variable-width lookbehind for Python 3.13 compat
 USERNAME_PATTERN = re.compile(
-    r"(?<=[Uu]ser(?:name)?[=: ]+)[\w.\-\\]+", re.IGNORECASE
+    r"(?:[Uu]ser(?:name)?[=: ]+)([\w.\-\\]+)"
 )
 
 
@@ -91,9 +92,9 @@ def anonymize_line(line: str) -> tuple[str, dict]:
 
     def _replace_user(m: re.Match) -> str:
         token = f"<MASKED_USER_{counter['user']}>"
-        mapping[token] = m.group(0)
+        mapping[token] = m.group(1)
         counter["user"] += 1
-        return token
+        return m.group(0).replace(m.group(1), token)
 
     line = IP_PATTERN.sub(_replace_ip, line)
     line = EMAIL_PATTERN.sub(_replace_email, line)
@@ -533,3 +534,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
