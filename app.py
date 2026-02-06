@@ -271,7 +271,8 @@ def call_claude_single(
             messages=[{"role": "user", "content": user_message}],
         )
         return _parse_json_response(response.content[0].text)
-    except Exception:
+    except Exception as e:
+        st.error(f"API call failed: {type(e).__name__}: {e}")
         return None
 
 
@@ -309,8 +310,8 @@ def call_claude_batch(
             return {item["group_id"]: item for item in parsed if "group_id" in item}
         elif isinstance(parsed, dict) and "group_id" in parsed:
             return {parsed["group_id"]: parsed}
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"Batch API call failed: {type(e).__name__}: {e}")
     return {}
 
 
@@ -353,6 +354,7 @@ def process_clusters(
 
     # --- Decide strategy: batch or concurrent singles ---
     ai_results: dict[str, dict | None] = {}
+    errors: list[str] = []
     completed = 0
 
     if batch_size > 1 and total > 1:
@@ -368,14 +370,17 @@ def process_clusters(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_run_batch, b): b for b in batches}
             for future in as_completed(futures):
-                batch_result, batch_items = future.result()
-                for fp, samples, anon_mapping in batch_items:
-                    key = fp[:12]
-                    result = batch_result.get(key)
-                    if result and anonymize and anon_mapping:
-                        result = deanonymize_result(result, anon_mapping)
-                    ai_results[fp] = result
-                    completed += 1
+                try:
+                    batch_result, batch_items = future.result()
+                    for fp, samples, anon_mapping in batch_items:
+                        key = fp[:12]
+                        result = batch_result.get(key)
+                        if result and anonymize and anon_mapping:
+                            result = deanonymize_result(result, anon_mapping)
+                        ai_results[fp] = result
+                        completed += 1
+                except Exception as e:
+                    errors.append(f"Batch thread error: {type(e).__name__}: {e}")
                 if progress_callback:
                     progress_callback(min(completed, total), total)
     else:
@@ -390,11 +395,18 @@ def process_clusters(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_run_single, p): p for p in prepared}
             for future in as_completed(futures):
-                fp, result = future.result()
-                ai_results[fp] = result
-                completed += 1
+                try:
+                    fp, result = future.result()
+                    ai_results[fp] = result
+                    completed += 1
+                except Exception as e:
+                    errors.append(f"Thread error: {type(e).__name__}: {e}")
                 if progress_callback:
-                    progress_callback(completed, total)
+                    progress_callback(min(max(completed, 1), total), total)
+
+    # Surface any errors that occurred
+    for err in errors:
+        st.error(err)
 
     # --- Aggregate results ---
     results: list[dict] = []
@@ -486,7 +498,10 @@ def main():
         )
         st.title("⚙️ Settings")
 
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        try:
+            api_key = st.secrets["ANTHROPIC_API_KEY"]
+        except (KeyError, FileNotFoundError):
+            api_key = ""
 
         model_choice = st.selectbox(
             "AI Model",
