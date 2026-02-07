@@ -37,8 +37,10 @@ st.set_page_config(
 # Constants
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """<system_prompt>
-You are a Security Data Engineer. Given a raw log line:
-1. Extract all meaningful variables into a valid JSON object.
+You are a Security Data Engineer. Given a raw log line (which may be a multi-line
+entry joined with '  |  ' separators):
+1. Extract ALL meaningful variables into a valid JSON object — including fields from
+   continuation blocks like Application Information, Network Information, Filter Information, etc.
 2. Clean and flatten the "message" field. Remove extraneous line breaks and whitespace.
 3. Normalize any timestamps to ISO-8601 format (YYYY-MM-DDTHH:MM:SS±HH:MM).
 4. Provide a high-performance PCRE Regex pattern to parse this specific log format.
@@ -52,16 +54,35 @@ You are a Security Data Engineer. Given a raw log line:
     "event_id": "event id or null",
     "severity": "severity level or null",
     "message": "cleaned message text",
-    "additional_fields": {}
+    "additional_fields": {
+      "process_id": "...",
+      "application_name": "...",
+      "direction": "...",
+      "source_address": "...",
+      "source_port": "...",
+      "destination_address": "...",
+      "destination_port": "...",
+      "protocol": "...",
+      "filter_id": "...",
+      "layer_name": "...",
+      "...": "include ALL fields found in the log"
+    }
   },
   "generated_regex": "^(?P<timestamp>...) ...",
   "confidence_score": 0.95
 }
+
+IMPORTANT: Extract EVERY key-value pair found in the log, especially from structured
+blocks like "Network Information:", "Application Information:", "Filter Information:", etc.
+Do NOT skip any fields. If a field has no value, set it to null.
 </system_prompt>"""
 
 BATCH_SYSTEM_PROMPT = """<system_prompt>
 You are a Security Data Engineer. You will receive MULTIPLE log pattern groups.
-For EACH group, extract fields, normalize timestamps to ISO-8601, and generate a PCRE regex.
+Log entries may be multi-line, joined with '  |  ' separators.
+For EACH group, extract ALL fields (including from continuation blocks like
+Network Information, Application Information, Filter Information), normalize
+timestamps to ISO-8601, and generate a PCRE regex.
 
 Output ONLY a valid JSON array — no markdown, no explanation. Each element must follow this schema:
 {
@@ -72,7 +93,7 @@ Output ONLY a valid JSON array — no markdown, no explanation. Each element mus
     "event_id": "event id or null",
     "severity": "severity level or null",
     "message": "cleaned message text",
-    "additional_fields": {}
+    "additional_fields": {"...include ALL fields found..."}
   },
   "generated_regex": "^(?P<timestamp>...) ...",
   "confidence_score": 0.95
@@ -147,9 +168,78 @@ def deanonymize_result(result: dict, mapping: dict) -> dict:
 # =========================================================================
 # 2. LOG FINGERPRINTING / CLUSTERING  (lightweight Drain-style)
 # =========================================================================
+
+# Patterns that indicate the START of a new log entry (not a continuation)
+_NEW_ENTRY_PATTERNS = [
+    # ISO-ish timestamp: 2024-09-30 02:49:08 or 2024-09-30T02:49:08
+    re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}"),
+    # Syslog BSD: Sep 30 02:47:14
+    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}"),
+    # CEF header
+    re.compile(r"^CEF:\d"),
+    # RFC 5424 syslog: <14>1 2024-...
+    re.compile(r"^<\d+>\d?\s*\d{4}-"),
+    # Syslog priority: <14> followed by timestamp
+    re.compile(r"^<\d+>"),
+    # Tab-separated with leading timestamp (like the Windows event logs in the screenshot)
+    re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}:\d{2}\t"),
+    # Windows Event header lines with tab separators and known keywords
+    re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+"),
+]
+
+
+def _is_new_entry(line: str) -> bool:
+    """Check if a line looks like the start of a new log entry."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return any(p.match(stripped) for p in _NEW_ENTRY_PATTERNS)
+
+
+def reassemble_multiline(raw_lines: list[str]) -> list[str]:
+    """
+    Join continuation lines back to their parent log entry.
+
+    Lines that don't start with a recognized timestamp/header pattern
+    are treated as continuations of the previous entry and joined with
+    a '  |  ' separator to preserve structure while keeping it single-line.
+    """
+    if not raw_lines:
+        return []
+
+    entries: list[str] = []
+    current: list[str] = []
+
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if _is_new_entry(stripped):
+            # Flush the previous entry
+            if current:
+                entries.append("  |  ".join(current))
+            current = [stripped]
+        else:
+            # Continuation line — append to current entry
+            if current:
+                current.append(stripped)
+            else:
+                # Orphan line at the start; treat as its own entry
+                current = [stripped]
+
+    # Flush last entry
+    if current:
+        entries.append("  |  ".join(current))
+
+    return entries
+
+
 def _tokenize(line: str) -> list[str]:
     """Split a log line into tokens, replacing variable-looking parts."""
-    tokens = line.strip().split()
+    # For multi-line entries, fingerprint only the first line (header)
+    header = line.split("  |  ")[0] if "  |  " in line else line
+    tokens = header.strip().split()
     normalized: list[str] = []
     for t in tokens:
         if re.fullmatch(r"\d+", t):
@@ -656,18 +746,21 @@ def main():
         st.stop()
 
     # -- Ingest & Cluster -----------------------------------------------
-    all_lines: list[str] = []
+    all_raw_lines: list[str] = []
     file_sources: dict[str, list[str]] = {}
 
     for uf in uploaded_files:
         lines = list(stream_lines(uf))
-        all_lines.extend(lines)
+        all_raw_lines.extend(lines)
         file_sources[uf.name] = lines
+
+    # Reassemble multi-line log entries (e.g., Windows Event Logs)
+    all_lines = reassemble_multiline(all_raw_lines)
 
     # Detect file changes and clear stale results
     file_sig = hashlib.md5(
         "|".join(sorted(file_sources.keys())).encode()
-        + str(len(all_lines)).encode()
+        + str(len(all_raw_lines)).encode()
     ).hexdigest()
     if st.session_state.get("_file_sig") != file_sig:
         st.session_state.pop("results", None)
@@ -677,11 +770,17 @@ def main():
         st.session_state["_file_sig"] = file_sig
 
     st.success(
-        f"Loaded **{len(all_lines):,}** lines from **{len(uploaded_files)}** file(s)."
+        f"Loaded **{len(all_raw_lines):,}** raw lines → "
+        f"**{len(all_lines):,}** log entries from **{len(uploaded_files)}** file(s)."
     )
 
-    with st.expander("📄 Raw log preview (first 20 lines)", expanded=False):
-        st.code("\n".join(all_lines[:20]), language="log")
+    with st.expander("📄 Log entry preview (first 10 entries)", expanded=False):
+        for i, entry in enumerate(all_lines[:10]):
+            # Display multi-line entries readably
+            display = entry.replace("  |  ", "\n    ")
+            st.code(display, language="log")
+            if i < min(9, len(all_lines) - 1):
+                st.markdown("---")
 
     clusters = cluster_logs(all_lines)
     n_clusters = len(clusters)
