@@ -1,14 +1,15 @@
 """
 AI-Powered Log Harmonizer & Regex Generator
 =============================================
-A Streamlit app that transforms unstructured text logs into structured
-JSON/CSV data and generates reusable SIEM parsing rules (Regex/Grok/KQL).
+Two-phase architecture for massive-scale log parsing:
 
-Performance optimizations:
-- Concurrent API calls (ThreadPoolExecutor)
-- Batch multiple clusters into single prompts
-- Optional fast model (Haiku) for bulk parsing
-- Result caching to avoid redundant API calls
+Phase 1 — LEARN: Upload a small sample of files. AI discovers patterns
+          and generates regex. Patterns are saved to a reusable library.
+
+Phase 2 — APPLY: Upload millions of files. The app matches fingerprints
+          to the library and parses locally with regex. ZERO API calls.
+
+Only calls AI for genuinely new/unrecognized patterns.
 """
 
 import streamlit as st
@@ -117,7 +118,6 @@ IP_PATTERN = re.compile(
     r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
 )
 EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
-# Uses a capturing group instead of variable-width lookbehind for Python 3.13 compat
 USERNAME_PATTERN = re.compile(
     r"(?:[Uu]ser(?:name)?[=: ]+)([\w.\-\\]+)"
 )
@@ -166,30 +166,20 @@ def deanonymize_result(result: dict, mapping: dict) -> dict:
 
 
 # =========================================================================
-# 2. LOG FINGERPRINTING / CLUSTERING  (lightweight Drain-style)
+# 2. MULTI-LINE REASSEMBLY & FINGERPRINTING
 # =========================================================================
-
-# Patterns that indicate the START of a new log entry (not a continuation)
 _NEW_ENTRY_PATTERNS = [
-    # ISO-ish timestamp: 2024-09-30 02:49:08 or 2024-09-30T02:49:08
     re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}"),
-    # Syslog BSD: Sep 30 02:47:14
     re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}"),
-    # CEF header
     re.compile(r"^CEF:\d"),
-    # RFC 5424 syslog: <14>1 2024-...
     re.compile(r"^<\d+>\d?\s*\d{4}-"),
-    # Syslog priority: <14> followed by timestamp
     re.compile(r"^<\d+>"),
-    # Tab-separated with leading timestamp (like the Windows event logs in the screenshot)
     re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}:\d{2}\t"),
-    # Windows Event header lines with tab separators and known keywords
     re.compile(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+"),
 ]
 
 
 def _is_new_entry(line: str) -> bool:
-    """Check if a line looks like the start of a new log entry."""
     stripped = line.strip()
     if not stripped:
         return False
@@ -197,47 +187,31 @@ def _is_new_entry(line: str) -> bool:
 
 
 def reassemble_multiline(raw_lines: list[str]) -> list[str]:
-    """
-    Join continuation lines back to their parent log entry.
-
-    Lines that don't start with a recognized timestamp/header pattern
-    are treated as continuations of the previous entry and joined with
-    a '  |  ' separator to preserve structure while keeping it single-line.
-    """
+    """Join continuation lines back to their parent log entry."""
     if not raw_lines:
         return []
-
     entries: list[str] = []
     current: list[str] = []
-
     for line in raw_lines:
         stripped = line.strip()
         if not stripped:
             continue
-
         if _is_new_entry(stripped):
-            # Flush the previous entry
             if current:
                 entries.append("  |  ".join(current))
             current = [stripped]
         else:
-            # Continuation line — append to current entry
             if current:
                 current.append(stripped)
             else:
-                # Orphan line at the start; treat as its own entry
                 current = [stripped]
-
-    # Flush last entry
     if current:
         entries.append("  |  ".join(current))
-
     return entries
 
 
 def _tokenize(line: str) -> list[str]:
     """Split a log line into tokens, replacing variable-looking parts."""
-    # For multi-line entries, fingerprint only the first line (header)
     header = line.split("  |  ")[0] if "  |  " in line else line
     tokens = header.strip().split()
     normalized: list[str] = []
@@ -258,14 +232,12 @@ def _tokenize(line: str) -> list[str]:
 
 
 def fingerprint(line: str) -> str:
-    """Return a structural hash for a log line (Drain-style fingerprint)."""
     tokens = _tokenize(line)
     skeleton = " ".join(tokens)
     return hashlib.md5(skeleton.encode()).hexdigest()
 
 
 def cluster_logs(lines: list[str]) -> dict[str, list[str]]:
-    """Group log lines by structural fingerprint."""
     clusters: dict[str, list[str]] = defaultdict(list)
     for line in lines:
         if not line.strip():
@@ -279,7 +251,6 @@ def cluster_logs(lines: list[str]) -> dict[str, list[str]]:
 # 3. FILE INGESTION (streaming / chunked)
 # =========================================================================
 def stream_lines(uploaded_file, chunk_size: int = 1024 * 64) -> Generator[str, None, None]:
-    """Yield non-empty lines from an uploaded file in chunks."""
     uploaded_file.seek(0)
     buffer = ""
     while True:
@@ -298,19 +269,192 @@ def stream_lines(uploaded_file, chunk_size: int = 1024 * 64) -> Generator[str, N
         yield buffer.strip()
 
 
+def quick_scan_file(uploaded_file, max_lines: int = 20) -> list[str]:
+    """Read only the first N lines from a file — for fast format discovery."""
+    uploaded_file.seek(0)
+    lines: list[str] = []
+    buffer = ""
+    chunk_size = 1024 * 16  # small reads since we only need a few lines
+    while len(lines) < max_lines:
+        chunk = uploaded_file.read(chunk_size)
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8", errors="replace")
+        if not chunk:
+            break
+        buffer += chunk
+        while "\n" in buffer and len(lines) < max_lines:
+            line, buffer = buffer.split("\n", 1)
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+    return lines
+
+
+def discover_formats(
+    files: list,
+    scan_lines: int = 20,
+) -> tuple[dict[str, dict], int, int]:
+    """
+    Quick-scan all files to discover unique log formats.
+    Only reads the first N lines per file — very fast even for millions of files.
+
+    Returns:
+        format_map: {fingerprint: {"sample": str, "files": [filenames], "count": int}}
+        total_files: number of files scanned
+        total_lines_sampled: total lines read across all files
+    """
+    format_map: dict[str, dict] = {}
+    total_lines = 0
+
+    for uf in files:
+        sample_lines = quick_scan_file(uf, max_lines=scan_lines)
+        total_lines += len(sample_lines)
+
+        # Reassemble multi-line entries from sample
+        entries = reassemble_multiline(sample_lines)
+
+        for entry in entries:
+            fp = fingerprint(entry)
+            if fp not in format_map:
+                format_map[fp] = {
+                    "sample": entry,
+                    "files": [],
+                    "count": 0,
+                }
+            if uf.name not in format_map[fp]["files"]:
+                format_map[fp]["files"].append(uf.name)
+            format_map[fp]["count"] += 1
+
+    return format_map, len(files), total_lines
+
+
 # =========================================================================
-# 4. AI INTEGRATION  (Anthropic Claude — optimized)
+# 4. PATTERN LIBRARY — learn once, apply forever
+# =========================================================================
+def _empty_library() -> dict:
+    """Return a fresh empty pattern library structure."""
+    return {
+        "version": 2,
+        "created": datetime.now().isoformat(),
+        "patterns": {},   # fingerprint -> pattern entry
+    }
+
+
+def _add_to_library(library: dict, fp: str, ai_result: dict, sample: str) -> None:
+    """Add a learned pattern to the library."""
+    library["patterns"][fp] = {
+        "regex": ai_result.get("generated_regex", ""),
+        "field_names": list((ai_result.get("parsed_data") or {}).keys()),
+        "parsed_template": ai_result.get("parsed_data", {}),
+        "confidence": ai_result.get("confidence_score", 0),
+        "sample": sample[:500],
+        "learned_at": datetime.now().isoformat(),
+        # Store SIEM-specific outputs if present
+        "grok_pattern": ai_result.get("grok_pattern"),
+        "kql_parse": ai_result.get("kql_parse"),
+        "fortisiem_parser": ai_result.get("fortisiem_parser"),
+    }
+
+
+def apply_regex_locally(regex_str: str, line: str) -> dict | None:
+    """Try to parse a log line using a compiled regex. Returns named groups or None."""
+    try:
+        m = re.match(regex_str, line)
+        if m:
+            return {k: v for k, v in m.groupdict().items() if v is not None}
+    except re.error:
+        pass
+    return None
+
+
+def apply_library_to_entries(
+    library: dict,
+    clusters: dict[str, list[str]],
+    progress_callback=None,
+) -> tuple[list[dict], list[dict], list[str], dict[str, list[str]]]:
+    """
+    Parse all entries locally using the pattern library. Zero API calls.
+    Returns (results, regex_manifest, warnings, unmatched_clusters).
+    """
+    results: list[dict] = []
+    regex_manifest: list[dict] = []
+    warnings: list[str] = []
+    unmatched: dict[str, list[str]] = {}
+    patterns = library.get("patterns", {})
+
+    cluster_items = list(clusters.items())
+    total = len(cluster_items)
+
+    for idx, (fp, lines) in enumerate(cluster_items):
+        if progress_callback:
+            progress_callback(idx + 1, total)
+
+        pattern_entry = patterns.get(fp)
+
+        if pattern_entry is None:
+            unmatched[fp] = lines
+            continue
+
+        regex_str = pattern_entry.get("regex", "")
+        template = pattern_entry.get("parsed_template", {})
+
+        # Try regex-based extraction on first line to validate
+        regex_parsed = apply_regex_locally(regex_str, lines[0]) if regex_str else None
+
+        # Build manifest entry
+        manifest_entry = {
+            "cluster_id": fp[:12],
+            "sample_count": len(lines),
+            "regex": regex_str,
+            "confidence": pattern_entry.get("confidence", 0),
+            "source": "library",
+        }
+        if pattern_entry.get("grok_pattern"):
+            manifest_entry["grok_pattern"] = pattern_entry["grok_pattern"]
+        if pattern_entry.get("kql_parse"):
+            manifest_entry["kql_parse"] = pattern_entry["kql_parse"]
+        if pattern_entry.get("fortisiem_parser"):
+            manifest_entry["fortisiem_parser"] = pattern_entry["fortisiem_parser"]
+        regex_manifest.append(manifest_entry)
+
+        for line in lines:
+            if regex_parsed is not None:
+                # Use regex extraction for each line
+                parsed = apply_regex_locally(regex_str, line)
+                if parsed:
+                    row = parsed.copy()
+                else:
+                    # Regex didn't match this line — fall back to template
+                    row = flatten_parsed(template)
+            else:
+                # Regex doesn't work — use the AI-generated template fields
+                row = flatten_parsed(template)
+
+            row["_raw"] = line
+            row["_cluster_id"] = fp[:12]
+            row["_confidence"] = pattern_entry.get("confidence", 0)
+            row["_source"] = "library"
+            results.append(row)
+
+    if unmatched:
+        warnings.append(
+            f"{len(unmatched)} cluster(s) not in library ({sum(len(v) for v in unmatched.values()):,} lines). "
+            f"Use Learn mode to add them."
+        )
+
+    return results, regex_manifest, warnings, unmatched
+
+
+# =========================================================================
+# 5. AI INTEGRATION (Anthropic Claude)
 # =========================================================================
 def _get_client(api_key: str):
-    """Return an Anthropic client."""
     import anthropic
     return anthropic.Anthropic(api_key=api_key)
 
 
 def _parse_json_response(text: str) -> dict | list | None:
-    """Extract JSON from an AI response, handling markdown fences etc."""
     text = text.strip()
-    # Try markdown fences first
     json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if json_match:
         text = json_match.group(1).strip()
@@ -318,7 +462,6 @@ def _parse_json_response(text: str) -> dict | list | None:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Find outermost JSON structure
     for opener, closer in [("[", "]"), ("{", "}")]:
         try:
             start = text.index(opener)
@@ -329,60 +472,38 @@ def _parse_json_response(text: str) -> dict | list | None:
     return None
 
 
-def call_claude_single(
-    client, model: str, sample_lines: list[str], siem_format: str
-) -> tuple[dict | None, str | None]:
-    """Send a single cluster's samples to Claude. Returns (result, error_msg)."""
+def call_claude_single(client, model, sample_lines, siem_format):
     siem_extra = ""
     if siem_format == "grok":
-        siem_extra = (
-            "\nAdditionally, convert the PCRE regex into an Elastic Grok pattern "
-            'and include it as "grok_pattern" in your JSON output.'
-        )
+        siem_extra = '\nAlso include a "grok_pattern" in your JSON output.'
     elif siem_format == "kql":
-        siem_extra = (
-            "\nAdditionally, generate a Microsoft Sentinel KQL parse statement "
-            'and include it as "kql_parse" in your JSON output.'
-        )
+        siem_extra = '\nAlso include a "kql_parse" in your JSON output.'
     elif siem_format == "fortisiem":
         siem_extra = (
-            "\nAdditionally, generate a FortiSIEM XML parser pattern using "
-            "<patternDefinitions> and <parsingInstructions> blocks. "
-            'Include it as "fortisiem_parser" in your JSON output.'
+            '\nAlso generate a FortiSIEM XML parser with <patternDefinitions> '
+            'and <parsingInstructions>. Include as "fortisiem_parser" in your JSON.'
         )
 
     user_message = (
-        "Analyze the following raw log sample(s). For each unique format you see, "
-        "return ONE JSON object per the schema in your instructions.\n"
-        "If multiple samples share the same format, return only one object.\n"
-        f"{siem_extra}\n\n"
-        "--- RAW LOG SAMPLES ---\n"
+        "Analyze the following raw log sample(s). Return ONE JSON object.\n"
+        f"{siem_extra}\n\n--- RAW LOG SAMPLES ---\n"
         + "\n".join(sample_lines)
     )
-
     try:
         response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
+            model=model, max_tokens=2048, system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
         raw_text = response.content[0].text
         parsed = _parse_json_response(raw_text)
         if parsed is None:
-            return None, f"JSON parse failed. Raw response: {raw_text[:300]}"
+            return None, f"JSON parse failed. Raw: {raw_text[:300]}"
         return parsed, None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
 
-def call_claude_batch(
-    client,
-    model: str,
-    batch: list[tuple[str, list[str]]],
-    siem_format: str,
-) -> tuple[dict[str, dict | None], str | None]:
-    """Send multiple clusters in ONE API call. Returns ({group_id: result}, error_msg)."""
+def call_claude_batch(client, model, batch, siem_format):
     siem_extra = ""
     if siem_format == "grok":
         siem_extra = '\nFor each group, also include a "grok_pattern" field.'
@@ -399,12 +520,9 @@ def call_claude_batch(
         f"Analyze each group of log samples below. Return a JSON array with one "
         f"object per group.{siem_extra}\n{groups_text}"
     )
-
     try:
         response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=BATCH_SYSTEM_PROMPT,
+            model=model, max_tokens=4096, system=BATCH_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
         raw_text = response.content[0].text
@@ -419,9 +537,9 @@ def call_claude_batch(
 
 
 # =========================================================================
-# 5. CONCURRENT + BATCHED PROCESSING ENGINE
+# 6. LEARN ENGINE — discover patterns via AI
 # =========================================================================
-def process_clusters(
+def learn_patterns(
     api_key: str,
     clusters: dict[str, list[str]],
     siem_format: str,
@@ -430,18 +548,30 @@ def process_clusters(
     anonymize: bool,
     max_workers: int,
     batch_size: int,
+    existing_library: dict | None = None,
     progress_callback=None,
-) -> tuple[list[dict], list[dict], list[str]]:
+) -> tuple[dict, list[str]]:
     """
-    Process all clusters with concurrency and optional batching.
-    Returns (results_rows, regex_manifest, errors).
+    Discover patterns via AI and return an updated pattern library.
+    Skips clusters that already exist in the library.
+    Returns (updated_library, errors).
     """
-    client = _get_client(api_key)
-    cluster_items = list(clusters.items())
-    total = len(cluster_items)
+    library = existing_library or _empty_library()
+    existing_fps = set(library.get("patterns", {}).keys())
 
-    # --- Prepare samples (anonymize if needed) ---
-    prepared: list[tuple[str, list[str], dict]] = []  # (fp, samples, anon_mapping)
+    # Filter to only NEW clusters
+    new_clusters = {fp: lines for fp, lines in clusters.items() if fp not in existing_fps}
+
+    if not new_clusters:
+        return library, ["All clusters already in library. No API calls needed."]
+
+    client = _get_client(api_key)
+    cluster_items = list(new_clusters.items())
+    total = len(cluster_items)
+    errors: list[str] = []
+
+    # Prepare samples
+    prepared: list[tuple[str, list[str], dict]] = []
     for fp, lines in cluster_items:
         samples = lines[:samples_per_cluster]
         anon_mapping: dict = {}
@@ -455,16 +585,11 @@ def process_clusters(
             anon_mapping = combined
         prepared.append((fp, samples, anon_mapping))
 
-    # --- Decide strategy: batch or concurrent singles ---
     ai_results: dict[str, dict | None] = {}
-    errors: list[str] = []
     completed = 0
 
     if batch_size > 1 and total > 1:
-        # ---- BATCHED MODE: group clusters into batches, run batches concurrently ----
-        batches: list[list[tuple[str, list[str], dict]]] = []
-        for i in range(0, len(prepared), batch_size):
-            batches.append(prepared[i : i + batch_size])
+        batches = [prepared[i:i + batch_size] for i in range(0, len(prepared), batch_size)]
 
         def _run_batch(batch_items):
             batch_input = [(fp[:12], samples) for fp, samples, _ in batch_items]
@@ -479,18 +604,16 @@ def process_clusters(
                     if err:
                         errors.append(f"Batch error: {err}")
                     for fp, samples, anon_mapping in batch_items:
-                        key = fp[:12]
-                        result = batch_result.get(key)
+                        result = batch_result.get(fp[:12])
                         if result and anonymize and anon_mapping:
                             result = deanonymize_result(result, anon_mapping)
                         ai_results[fp] = result
                         completed += 1
                 except Exception as e:
-                    errors.append(f"Batch thread error: {type(e).__name__}: {e}")
+                    errors.append(f"Thread error: {type(e).__name__}: {e}")
                 if progress_callback:
                     progress_callback(min(completed, total), total)
     else:
-        # ---- CONCURRENT SINGLES MODE ----
         def _run_single(item):
             fp, samples, anon_mapping = item
             result, err = call_claude_single(client, model, samples, siem_format)
@@ -512,57 +635,27 @@ def process_clusters(
                 if progress_callback:
                     progress_callback(min(max(completed, 1), total), total)
 
-    # --- Aggregate results ---
-    results: list[dict] = []
-    regex_manifest: list[dict] = []
-
+    # Save learned patterns to library
+    learned = 0
     for fp, lines in cluster_items:
         ai_result = ai_results.get(fp)
         if ai_result is None:
             continue
+        _add_to_library(library, fp, ai_result, lines[0])
+        learned += 1
 
-        raw_regex = ai_result.get("generated_regex", "")
-        manifest_entry: dict = {
-            "cluster_id": fp[:12],
-            "sample_count": len(lines),
-            "regex": raw_regex,
-            "confidence": ai_result.get("confidence_score", 0),
-        }
-        if siem_format == "grok":
-            manifest_entry["grok_pattern"] = ai_result.get(
-                "grok_pattern", regex_to_grok(raw_regex)
-            )
-        elif siem_format == "kql":
-            fields = list((ai_result.get("parsed_data") or {}).keys())
-            manifest_entry["kql_parse"] = ai_result.get(
-                "kql_parse", regex_to_kql(raw_regex, fields)
-            )
-        elif siem_format == "fortisiem":
-            fields = list((ai_result.get("parsed_data") or {}).keys())
-            manifest_entry["fortisiem_parser"] = ai_result.get(
-                "fortisiem_parser", regex_to_fortisiem(raw_regex, fields)
-            )
-        regex_manifest.append(manifest_entry)
+    library["last_updated"] = datetime.now().isoformat()
+    errors.insert(0, f"Learned {learned} new pattern(s) from {total} cluster(s).")
 
-        parsed = ai_result.get("parsed_data", {})
-        for line in lines:
-            row = flatten_parsed(parsed)
-            row["_raw"] = line
-            row["_cluster_id"] = fp[:12]
-            row["_confidence"] = ai_result.get("confidence_score", 0)
-            results.append(row)
-
-    return results, regex_manifest, errors
+    return library, errors
 
 
 # =========================================================================
-# 6. SIEM FORMAT CONVERTERS
+# 7. SIEM FORMAT CONVERTERS
 # =========================================================================
 def regex_to_grok(regex: str) -> str:
-    """Best-effort conversion of a named-group PCRE regex to Grok syntax."""
-    def _replace(m: re.Match) -> str:
-        name = m.group(1)
-        pattern = m.group(2)
+    def _replace(m):
+        name, pattern = m.group(1), m.group(2)
         grok_type = "DATA"
         if "\\d" in pattern or pattern in (r"\d+", r"[0-9]+"):
             grok_type = "INT"
@@ -571,78 +664,45 @@ def regex_to_grok(regex: str) -> str:
         elif "ip" in name.lower():
             grok_type = "IP"
         return f"%{{{grok_type}:{name}}}"
-
     return re.sub(r"\(\?P<(\w+)>(.*?)\)", _replace, regex)
 
 
 def regex_to_kql(regex: str, fields: list[str]) -> str:
-    """Generate a minimal KQL parse statement from regex field names."""
     placeholders = " ".join(f"*{f}:string*" for f in fields)
-    return f"| parse RawLog with {placeholders}  // Adjust delimiters to match your data"
+    return f"| parse RawLog with {placeholders}  // Adjust delimiters"
 
 
 def regex_to_fortisiem(regex: str, fields: list[str]) -> str:
-    """Generate a FortiSIEM XML parser snippet from regex named groups."""
-    # Map common field names to FortiSIEM event attributes
-    forti_attr_map = {
-        "timestamp": "deviceTime",
-        "source": "reportingIP",
-        "src_ip": "srcIpAddr",
-        "dst_ip": "destIpAddr",
-        "src_port": "srcIpPort",
-        "dst_port": "destIpPort",
-        "event_id": "eventType",
-        "severity": "eventSeverity",
-        "message": "rawEventMsg",
-        "user": "user",
-        "username": "user",
-        "action": "eventAction",
-        "protocol": "ipProto",
-        "hostname": "hostName",
-        "process": "procName",
-        "pid": "procId",
+    forti_map = {
+        "timestamp": "deviceTime", "source": "reportingIP",
+        "src_ip": "srcIpAddr", "dst_ip": "destIpAddr",
+        "src_port": "srcIpPort", "dst_port": "destIpPort",
+        "event_id": "eventType", "severity": "eventSeverity",
+        "message": "rawEventMsg", "user": "user", "username": "user",
+        "action": "eventAction", "protocol": "ipProto",
+        "hostname": "hostName", "process": "procName", "pid": "procId",
     }
-
-    # Build pattern definitions
-    pattern_defs = []
+    patterns, rules = [], []
     for f in fields:
         if f == "additional_fields":
             continue
-        forti_attr = forti_attr_map.get(f.lower(), f)
-        pattern_defs.append(
-            f'    <pattern name="pat_{f}" list="">'
-            f'<![CDATA[<:gPatStr>]]></pattern>'
-        )
-
-    # Build parsing instructions
-    parse_rules = []
-    for f in fields:
-        if f == "additional_fields":
-            continue
-        forti_attr = forti_attr_map.get(f.lower(), f)
-        parse_rules.append(
-            f'    <fieldMapping attr="{forti_attr}" '
-            f'pattern="pat_{f}" group="1"/>'
-        )
-
-    xml = (
+        attr = forti_map.get(f.lower(), f)
+        patterns.append(f'    <pattern name="pat_{f}"><![CDATA[<:gPatStr>]]></pattern>')
+        rules.append(f'    <fieldMapping attr="{attr}" pattern="pat_{f}" group="1"/>')
+    return (
         '<eventParser name="Custom-LogHarmonizer">\n'
-        '  <patternDefinitions>\n'
-        + "\n".join(pattern_defs) + "\n"
+        '  <patternDefinitions>\n' + "\n".join(patterns) + "\n"
         '  </patternDefinitions>\n'
-        '  <parsingInstructions>\n'
-        + "\n".join(parse_rules) + "\n"
+        '  <parsingInstructions>\n' + "\n".join(rules) + "\n"
         '  </parsingInstructions>\n'
         '</eventParser>'
     )
-    return xml
 
 
 # =========================================================================
-# 7. RESULT AGGREGATION
+# 8. RESULT AGGREGATION
 # =========================================================================
 def flatten_parsed(parsed_data: dict) -> dict:
-    """Flatten nested parsed_data into a single-level dict for DataFrame."""
     flat: dict = {}
     for k, v in parsed_data.items():
         if isinstance(v, dict):
@@ -654,14 +714,12 @@ def flatten_parsed(parsed_data: dict) -> dict:
 
 
 # =========================================================================
-# 8. STREAMLIT UI
+# 9. STREAMLIT UI
 # =========================================================================
 def main():
     # -- Sidebar -------------------------------------------------------
     with st.sidebar:
-        st.image(
-            "https://img.icons8.com/fluency/96/parse-from-clipboard.png", width=60
-        )
+        st.image("https://img.icons8.com/fluency/96/parse-from-clipboard.png", width=60)
         st.title("⚙️ Settings")
 
         try:
@@ -670,266 +728,672 @@ def main():
             api_key = ""
 
         model_choice = st.selectbox(
-            "AI Model",
-            options=list(MODELS.keys()),
-            index=0,
-            help="Haiku = ~3x faster & cheaper. Sonnet = higher accuracy.",
+            "AI Model", options=list(MODELS.keys()), index=0,
+            help="Haiku = ~3× faster & cheaper. Sonnet = higher accuracy.",
         )
         model = MODELS[model_choice]
 
         siem_choice = st.selectbox(
-            "SIEM Output Format",
-            options=list(SIEM_FORMATS.keys()),
-            index=0,
+            "SIEM Output Format", options=list(SIEM_FORMATS.keys()), index=0,
         )
         siem_format = SIEM_FORMATS[siem_choice]
 
-        anonymize = st.toggle(
-            "🔒 Anonymization Mode",
-            value=False,
-            help="Mask IPs, emails, and usernames before sending to AI.",
-        )
+        anonymize = st.toggle("🔒 Anonymization Mode", value=False,
+            help="Mask IPs, emails, and usernames before sending to AI.")
 
         st.divider()
         st.markdown("**⚡ Performance**")
 
-        samples_per_cluster = st.slider(
-            "Samples per cluster",
-            min_value=1,
-            max_value=5,
-            value=2,
-            help="Lines per cluster sent to the AI.",
-        )
+        samples_per_cluster = st.slider("Samples per cluster", 1, 5, 2)
+        max_workers = st.slider("Parallel workers", 1, 8, 4)
+        batch_size = st.slider("Clusters per API call", 1, 10, 5)
 
-        max_workers = st.slider(
-            "Parallel workers",
-            min_value=1,
-            max_value=8,
-            value=4,
-            help="Concurrent API calls. Higher = faster but may hit rate limits.",
-        )
+        st.divider()
 
-        batch_size = st.slider(
-            "Clusters per API call",
-            min_value=1,
-            max_value=10,
-            value=5,
-            help="Batch multiple clusters into one prompt. Reduces total API calls.",
+        # -- Pattern Library Management --
+        st.markdown("**📚 Pattern Library**")
+        lib = st.session_state.get("pattern_library")
+        if lib:
+            n_patterns = len(lib.get("patterns", {}))
+            st.success(f"{n_patterns} pattern(s) loaded")
+        else:
+            st.caption("No library loaded")
+
+        uploaded_lib = st.file_uploader(
+            "Import library (.json)", type=["json"], key="lib_upload",
         )
+        if uploaded_lib:
+            try:
+                lib_data = json.load(uploaded_lib)
+                if "patterns" in lib_data:
+                    st.session_state["pattern_library"] = lib_data
+                    st.success(f"Imported {len(lib_data['patterns'])} patterns!")
+                    st.rerun()
+                else:
+                    st.error("Invalid library file — missing 'patterns' key.")
+            except json.JSONDecodeError:
+                st.error("Invalid JSON file.")
+
+        if lib:
+            lib_json = json.dumps(lib, indent=2, default=str)
+            st.download_button(
+                "⬇️ Export Library",
+                data=lib_json,
+                file_name=f"pattern_library_{datetime.now():%Y%m%d_%H%M%S}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            if st.button("🗑️ Clear Library", use_container_width=True):
+                st.session_state.pop("pattern_library", None)
+                st.rerun()
 
         st.divider()
         st.caption("Built for SOC analysts & security engineers.")
 
     # -- Header --------------------------------------------------------
     st.title("🔍 Log Harmonizer & Regex Generator")
-    st.markdown(
-        "Upload raw `.txt` log files → get structured data + SIEM-ready parsing rules."
-    )
 
-    # -- File Upload ---------------------------------------------------
-    uploaded_files = st.file_uploader(
-        "Upload log files",
-        type=["txt", "log", "csv"],
-        accept_multiple_files=True,
-        help="Upload one or more raw log files.",
-    )
+    # -- Mode Tabs -----------------------------------------------------
+    tab_auto, tab_discover, tab_learn, tab_apply = st.tabs([
+        "🚀 Auto Pipeline",
+        "🔎 Discover Formats",
+        "🧠 Learn Patterns (uses AI)",
+        "⚡ Apply & Parse (no AI)",
+    ])
 
-    if not uploaded_files:
-        st.info("👆 Upload one or more log files to get started.")
-        st.stop()
-
-    if not api_key:
-        st.warning(
-            "API key not found. Add `ANTHROPIC_API_KEY` to your Streamlit secrets "
-            "(Settings → Secrets)."
+    # ==================================================================
+    # AUTO PIPELINE — dump files, get results, minimal AI
+    # ==================================================================
+    with tab_auto:
+        st.markdown(
+            "**Just upload everything.** The app auto-detects known patterns "
+            "(parsed locally, free) and calls AI only for new ones. "
+            "Your Pattern Library grows automatically."
         )
-        st.stop()
 
-    # -- Ingest & Cluster -----------------------------------------------
-    all_raw_lines: list[str] = []
-    file_sources: dict[str, list[str]] = {}
+        auto_files = st.file_uploader(
+            "Upload log files (any type, any mix)",
+            type=["txt", "log", "csv"],
+            accept_multiple_files=True,
+            key="auto_files",
+        )
 
-    for uf in uploaded_files:
-        lines = list(stream_lines(uf))
-        all_raw_lines.extend(lines)
-        file_sources[uf.name] = lines
+        if not auto_files:
+            st.info("👆 Dump any log files here — the pipeline handles the rest.")
 
-    # Reassemble multi-line log entries (e.g., Windows Event Logs)
-    all_lines = reassemble_multiline(all_raw_lines)
+        elif not api_key:
+            st.warning("API key not found. Add `ANTHROPIC_API_KEY` to Streamlit secrets.")
 
-    # Detect file changes and clear stale results
-    file_sig = hashlib.md5(
-        "|".join(sorted(file_sources.keys())).encode()
-        + str(len(all_raw_lines)).encode()
-    ).hexdigest()
-    if st.session_state.get("_file_sig") != file_sig:
-        st.session_state.pop("results", None)
-        st.session_state.pop("regex_manifest", None)
-        st.session_state.pop("siem_format", None)
-        st.session_state.pop("elapsed", None)
-        st.session_state["_file_sig"] = file_sig
+        else:
+            # Ingest everything
+            auto_raw: list[str] = []
+            for uf in auto_files:
+                auto_raw.extend(stream_lines(uf))
+            auto_entries = reassemble_multiline(auto_raw)
+            auto_clusters = cluster_logs(auto_entries)
 
-    st.success(
-        f"Loaded **{len(all_raw_lines):,}** raw lines → "
-        f"**{len(all_lines):,}** log entries from **{len(uploaded_files)}** file(s)."
-    )
+            lib = st.session_state.get("pattern_library", _empty_library())
+            lib_fps = set(lib.get("patterns", {}).keys())
 
-    with st.expander("📄 Log entry preview (first 10 entries)", expanded=False):
-        for i, entry in enumerate(all_lines[:10]):
-            # Display multi-line entries readably
-            display = entry.replace("  |  ", "\n    ")
-            st.code(display, language="log")
-            if i < min(9, len(all_lines) - 1):
-                st.markdown("---")
+            known_fps = set(auto_clusters.keys()) & lib_fps
+            new_fps = set(auto_clusters.keys()) - lib_fps
+            known_lines = sum(len(auto_clusters[fp]) for fp in known_fps)
+            new_lines = sum(len(auto_clusters[fp]) for fp in new_fps)
+            est_calls = max(1, -(-len(new_fps) // batch_size)) if new_fps else 0
 
-    clusters = cluster_logs(all_lines)
-    n_clusters = len(clusters)
-    n_api_calls = max(1, -(-n_clusters // batch_size))  # ceil division
-    st.info(
-        f"Identified **{n_clusters}** unique log pattern(s) — "
-        f"will make ~**{n_api_calls}** API call(s) "
-        f"with **{max_workers}** parallel workers."
-    )
+            # Clear stale results on file change
+            auto_sig = hashlib.md5(
+                str(len(auto_raw)).encode() + str(len(auto_entries)).encode()
+            ).hexdigest()
+            if st.session_state.get("_auto_sig") != auto_sig:
+                st.session_state.pop("auto_results", None)
+                st.session_state["_auto_sig"] = auto_sig
 
-    # -- Process Button -------------------------------------------------
-    if st.button("🚀 Harmonize Logs", type="primary", use_container_width=True):
-        progress = st.progress(0, text="Processing clusters…")
-        start_time = time.time()
+            # Stats dashboard
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Log Entries", f"{len(auto_entries):,}")
+            col2.metric("Unique Patterns", len(auto_clusters))
+            col3.metric("✅ Known (free)", f"{known_lines:,}")
+            col4.metric("🆕 New (AI needed)", f"{new_lines:,}")
+            col5.metric("Est. API Calls", est_calls)
 
-        def _update(done, total):
-            progress.progress(
-                done / total, text=f"Processing {done}/{total} clusters…"
+            if not new_fps:
+                st.success(
+                    f"All {len(auto_clusters)} pattern(s) already in library — "
+                    f"**zero API calls** needed!"
+                )
+
+            if st.button("🚀 Run Pipeline", type="primary", use_container_width=True):
+                start_time = time.time()
+                all_messages: list[str] = []
+
+                # Step 1: Learn new patterns if any exist
+                if new_fps:
+                    progress = st.progress(0, text="Step 1/2 — Learning new patterns…")
+
+                    def _auto_learn(done, total):
+                        progress.progress(
+                            done / total,
+                            text=f"Step 1/2 — Learning {done}/{total} new patterns…",
+                        )
+
+                    new_clusters_only = {fp: auto_clusters[fp] for fp in new_fps}
+                    updated_lib, learn_msgs = learn_patterns(
+                        api_key=api_key,
+                        clusters=new_clusters_only,
+                        siem_format=siem_format,
+                        model=model,
+                        samples_per_cluster=samples_per_cluster,
+                        anonymize=anonymize,
+                        max_workers=max_workers,
+                        batch_size=batch_size,
+                        existing_library=lib,
+                        progress_callback=_auto_learn,
+                    )
+                    st.session_state["pattern_library"] = updated_lib
+                    lib = updated_lib
+                    all_messages.extend(learn_msgs)
+                    progress.empty()
+
+                # Step 2: Parse ALL entries with the (now-updated) library
+                step_label = "Step 2/2" if new_fps else "Parsing"
+                progress = st.progress(0, text=f"{step_label} — Parsing locally…")
+
+                def _auto_apply(done, total):
+                    progress.progress(
+                        done / total,
+                        text=f"{step_label} — {done}/{total} clusters…",
+                    )
+
+                results, regex_manifest, warnings, unmatched = apply_library_to_entries(
+                    library=lib,
+                    clusters=auto_clusters,
+                    progress_callback=_auto_apply,
+                )
+                all_messages.extend(warnings)
+                elapsed = time.time() - start_time
+                progress.empty()
+
+                for msg in all_messages:
+                    if "error" in msg.lower():
+                        st.error(msg)
+                    elif "not in library" in msg.lower():
+                        st.warning(msg)
+                    else:
+                        st.success(msg)
+
+                if not results:
+                    st.error("No results produced. Check API key and log formats.")
+                    st.stop()
+
+                actual_calls = est_calls if new_fps else 0
+                st.toast(
+                    f"Parsed {len(results):,} entries in {elapsed:.1f}s "
+                    f"({actual_calls} API calls)",
+                    icon="🚀",
+                )
+
+                st.session_state["auto_results"] = results
+                st.session_state["auto_manifest"] = regex_manifest
+                st.session_state["auto_elapsed"] = elapsed
+                st.session_state["auto_api_calls"] = actual_calls
+                st.rerun()
+
+            # -- Display results --
+            if "auto_results" not in st.session_state:
+                st.stop()
+
+            results = st.session_state["auto_results"]
+            regex_manifest = st.session_state.get("auto_manifest", [])
+            elapsed = st.session_state.get("auto_elapsed", 0)
+            actual_calls = st.session_state.get("auto_api_calls", 0)
+
+            st.divider()
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Parsed Lines", f"{len(results):,}")
+            col_m2.metric("Pattern Classes", len(regex_manifest))
+            col_m3.metric("Processing Time", f"{elapsed:.1f}s")
+            col_m4.metric("API Calls Used", actual_calls)
+
+            st.subheader("📊 Parsed Results")
+            df = pd.DataFrame(results)
+            col_order = ["_raw", "_cluster_id", "_confidence", "_source"] + [
+                c for c in df.columns if not c.startswith("_")
+            ]
+            df = df[[c for c in col_order if c in df.columns]]
+
+            tab_table, tab_raw_view = st.tabs(["Structured Table", "Raw vs. Parsed"])
+            with tab_table:
+                st.dataframe(df, use_container_width=True, height=400)
+            with tab_raw_view:
+                if results:
+                    idx = st.slider("Select row", 0, len(results) - 1, 0, key="auto_row")
+                    row = results[idx]
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**Raw Log**")
+                        st.code(row.get("_raw", "").replace("  |  ", "\n    "), language="log")
+                    with c2:
+                        st.markdown("**Parsed JSON**")
+                        st.json({k: v for k, v in row.items() if not k.startswith("_")})
+
+            st.divider()
+            st.subheader("🧩 Regex / SIEM Manifest")
+            for entry in regex_manifest:
+                with st.expander(
+                    f"Cluster `{entry['cluster_id']}` — {entry['sample_count']} lines "
+                    f"({entry.get('confidence', 0):.0%}) — {entry.get('source', 'ai')}"
+                ):
+                    st.code(entry.get("regex", ""), language="regex")
+                    for key, label, lang in [
+                        ("grok_pattern", "Grok Pattern", None),
+                        ("kql_parse", "KQL Parse", "kql"),
+                        ("fortisiem_parser", "FortiSIEM Parser", "xml"),
+                    ]:
+                        if key in entry:
+                            st.markdown(f"**{label}**")
+                            st.code(entry[key], language=lang)
+
+            st.divider()
+            st.subheader("📦 Export")
+            col_csv, col_regex, col_json = st.columns(3)
+            with col_csv:
+                csv_buf = io.StringIO()
+                df.to_csv(csv_buf, index=False)
+                st.download_button(
+                    "⬇️ Master CSV", data=csv_buf.getvalue(),
+                    file_name=f"harmonized_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+            with col_regex:
+                st.download_button(
+                    "⬇️ Regex Manifest",
+                    data=json.dumps(regex_manifest, indent=2),
+                    file_name=f"regex_manifest_{datetime.now():%Y%m%d_%H%M%S}.json",
+                    mime="application/json", use_container_width=True,
+                )
+            with col_json:
+                st.download_button(
+                    "⬇️ Full Parsed JSON",
+                    data=json.dumps(results, indent=2, default=str),
+                    file_name=f"parsed_logs_{datetime.now():%Y%m%d_%H%M%S}.json",
+                    mime="application/json", use_container_width=True,
+                )
+
+    # ==================================================================
+    # DISCOVER TAB — fast scan to find unique formats across all files
+    # ==================================================================
+    with tab_discover:
+        st.markdown(
+            "**Dump all your files here** — even millions. The app reads only the "
+            "first ~20 lines per file to fingerprint the log format. "
+            "It then tells you exactly how many unique formats exist and which "
+            "ones need to be learned."
+        )
+
+        discover_files = st.file_uploader(
+            "Upload ALL log files (fast scan — reads first 20 lines per file)",
+            type=["txt", "log", "csv"],
+            accept_multiple_files=True,
+            key="discover_files",
+        )
+
+        if not discover_files:
+            st.info("👆 Upload files to discover log formats.")
+        else:
+            scan_depth = st.slider(
+                "Lines to scan per file", 10, 100, 20, key="scan_depth",
+                help="More lines = better discovery but slower scan.",
             )
 
-        results, regex_manifest, proc_errors = process_clusters(
-            api_key=api_key,
-            clusters=clusters,
-            siem_format=siem_format,
-            model=model,
-            samples_per_cluster=samples_per_cluster,
-            anonymize=anonymize,
-            max_workers=max_workers,
-            batch_size=batch_size,
-            progress_callback=_update,
+            if st.button("🔎 Scan Files", type="primary", use_container_width=True):
+                with st.spinner(f"Scanning {len(discover_files):,} files…"):
+                    start = time.time()
+                    fmt_map, n_files, n_lines = discover_formats(
+                        discover_files, scan_lines=scan_depth,
+                    )
+                    elapsed = time.time() - start
+
+                st.session_state["discover_results"] = fmt_map
+                st.session_state["discover_stats"] = (n_files, n_lines, elapsed)
+                st.rerun()
+
+            if "discover_results" in st.session_state:
+                fmt_map = st.session_state["discover_results"]
+                n_files, n_lines, elapsed = st.session_state["discover_stats"]
+
+                lib = st.session_state.get("pattern_library", _empty_library())
+                lib_fps = set(lib.get("patterns", {}).keys())
+                known_fps = set(fmt_map.keys()) & lib_fps
+                new_fps = set(fmt_map.keys()) - lib_fps
+
+                st.divider()
+                col_d1, col_d2, col_d3, col_d4, col_d5 = st.columns(5)
+                col_d1.metric("Files Scanned", f"{n_files:,}")
+                col_d2.metric("Lines Sampled", f"{n_lines:,}")
+                col_d3.metric("Unique Formats", len(fmt_map))
+                col_d4.metric("✅ Already in Library", len(known_fps))
+                col_d5.metric("🆕 Need Learning", len(new_fps))
+
+                st.caption(f"Scan completed in {elapsed:.1f}s")
+
+                if not new_fps:
+                    st.success(
+                        "All discovered formats are already in your Pattern Library. "
+                        "Go straight to the **Apply & Parse** tab!"
+                    )
+                else:
+                    est_calls = max(1, -(-len(new_fps) // batch_size))
+                    st.info(
+                        f"Only **{len(new_fps)}** new format(s) to learn — "
+                        f"~**{est_calls}** API call(s). "
+                        f"Go to the **Learn Patterns** tab to teach them."
+                    )
+
+                # Show discovered formats
+                st.subheader("Discovered Formats")
+                for fp, info in sorted(
+                    fmt_map.items(),
+                    key=lambda x: x[1]["count"],
+                    reverse=True,
+                ):
+                    status = "✅ In Library" if fp in lib_fps else "🆕 New"
+                    n_src_files = len(info['files'])
+                    file_list = ", ".join(info['files'][:5])
+                    if n_src_files > 5:
+                        file_list += f", … (+{n_src_files - 5} more)"
+
+                    with st.expander(
+                        f"{status} | Pattern `{fp[:12]}` — "
+                        f"found in {n_src_files} file(s), {info['count']} sample(s)"
+                    ):
+                        st.markdown(f"**Source files:** {file_list}")
+                        st.markdown("**Sample entry:**")
+                        display = info["sample"].replace("  |  ", "\n    ")
+                        st.code(display[:500], language="log")
+
+    # ==================================================================
+    # LEARN TAB
+    # ==================================================================
+    with tab_learn:
+        st.markdown(
+            "Upload log files with **new formats** to teach the AI. "
+            "It skips patterns already in your library — only new ones cost API calls. "
+            "You can upload everything; the app auto-deduplicates."
         )
 
-        elapsed = time.time() - start_time
-        progress.empty()
+        learn_files = st.file_uploader(
+            "Upload log files to learn from",
+            type=["txt", "log", "csv"],
+            accept_multiple_files=True,
+            key="learn_files",
+            help="Upload any files. Only new/unknown patterns will be sent to AI.",
+        )
 
-        # Show any errors that occurred during processing
-        for err in proc_errors:
-            st.error(err)
+        if not learn_files:
+            st.info("👆 Upload files to discover and learn patterns.")
 
-        if not results:
-            st.error("No results were produced. Check your API key and log format.")
+        elif not api_key:
+            st.warning("API key not found. Add `ANTHROPIC_API_KEY` to Streamlit secrets.")
+
+        else:
+            # Ingest
+            learn_raw: list[str] = []
+            for uf in learn_files:
+                learn_raw.extend(stream_lines(uf))
+            learn_entries = reassemble_multiline(learn_raw)
+            learn_clusters = cluster_logs(learn_entries)
+
+            lib = st.session_state.get("pattern_library", _empty_library())
+            existing_fps = set(lib.get("patterns", {}).keys())
+            new_fps = set(learn_clusters.keys()) - existing_fps
+            skipped_fps = set(learn_clusters.keys()) & existing_fps
+
+            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+            col_s1.metric("Log Entries", f"{len(learn_entries):,}")
+            col_s2.metric("Unique Patterns", len(learn_clusters))
+            col_s3.metric("🆕 New", len(new_fps))
+            col_s4.metric("⏭️ Skipped (known)", len(skipped_fps))
+
+            if not new_fps:
+                st.success("All patterns already in library. No API calls needed!")
+            else:
+                est_calls = max(1, -(-len(new_fps) // batch_size))
+                st.info(
+                    f"Will make ~**{est_calls}** API call(s) to learn "
+                    f"**{len(new_fps)}** new pattern(s). "
+                    f"**{len(skipped_fps)}** known pattern(s) will be skipped."
+                )
+
+                if st.button("🧠 Learn Patterns", type="primary", use_container_width=True):
+                    progress = st.progress(0, text="Learning patterns…")
+                    start = time.time()
+
+                    def _update(done, total):
+                        progress.progress(done / total, text=f"Learning {done}/{total}…")
+
+                    updated_lib, msgs = learn_patterns(
+                        api_key=api_key,
+                        clusters=learn_clusters,
+                        siem_format=siem_format,
+                        model=model,
+                        samples_per_cluster=samples_per_cluster,
+                        anonymize=anonymize,
+                        max_workers=max_workers,
+                        batch_size=batch_size,
+                        existing_library=lib,
+                        progress_callback=_update,
+                    )
+
+                    elapsed = time.time() - start
+                    progress.empty()
+
+                    st.session_state["pattern_library"] = updated_lib
+
+                    for msg in msgs:
+                        if "error" in msg.lower():
+                            st.error(msg)
+                        else:
+                            st.success(msg)
+                    st.toast(f"Done in {elapsed:.1f}s", icon="🧠")
+                    st.rerun()
+
+            # Show current library
+            lib = st.session_state.get("pattern_library")
+            if lib and lib.get("patterns"):
+                st.divider()
+                st.subheader("📚 Current Pattern Library")
+                for fp, entry in lib["patterns"].items():
+                    with st.expander(
+                        f"Pattern `{fp[:12]}` — confidence {entry.get('confidence', 0):.0%}"
+                    ):
+                        st.markdown("**Sample:**")
+                        st.code(entry.get("sample", "")[:300], language="log")
+                        st.markdown("**Fields:**")
+                        st.write(entry.get("field_names", []))
+                        if entry.get("regex"):
+                            st.markdown("**Regex:**")
+                            st.code(entry["regex"], language="regex")
+
+    # ==================================================================
+    # APPLY TAB
+    # ==================================================================
+    with tab_apply:
+        lib = st.session_state.get("pattern_library")
+
+        if not lib or not lib.get("patterns"):
+            st.warning(
+                "No Pattern Library loaded. Use the **Learn** tab first, or "
+                "import an existing library from the sidebar."
+            )
             st.stop()
 
-        st.toast(f"Done in {elapsed:.1f}s", icon="⚡")
-
-        # Store in session
-        st.session_state["results"] = results
-        st.session_state["regex_manifest"] = regex_manifest
-        st.session_state["siem_format"] = siem_format
-        st.session_state["elapsed"] = elapsed
-        st.rerun()
-
-    # -- Display Results ------------------------------------------------
-    if "results" not in st.session_state:
-        st.stop()
-
-    results = st.session_state["results"]
-    regex_manifest = st.session_state["regex_manifest"]
-    siem_format = st.session_state.get("siem_format", "regex")
-    elapsed = st.session_state.get("elapsed", 0)
-
-    st.divider()
-    col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("Parsed Lines", f"{len(results):,}")
-    col_m2.metric("Pattern Classes", len(regex_manifest))
-    col_m3.metric("Processing Time", f"{elapsed:.1f}s")
-
-    st.subheader("📊 Parsed Results")
-
-    df = pd.DataFrame(results)
-    col_order = ["_raw", "_cluster_id", "_confidence"] + [
-        c for c in df.columns if not c.startswith("_")
-    ]
-    df = df[[c for c in col_order if c in df.columns]]
-
-    # Side-by-side view
-    tab_table, tab_raw = st.tabs(["Structured Table", "Raw vs. Parsed"])
-    with tab_table:
-        st.dataframe(df, use_container_width=True, height=400)
-
-    with tab_raw:
-        if len(results) > 0:
-            sample_idx = st.slider("Select row", 0, len(results) - 1, 0)
-            row = results[sample_idx]
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Raw Log**")
-                st.code(row.get("_raw", ""), language="log")
-            with c2:
-                st.markdown("**Parsed JSON**")
-                display = {k: v for k, v in row.items() if not k.startswith("_")}
-                st.json(display)
-
-    # -- Regex Manifest -------------------------------------------------
-    st.divider()
-    st.subheader("🧩 Regex / SIEM Manifest")
-
-    for entry in regex_manifest:
-        with st.expander(
-            f"Cluster `{entry['cluster_id']}` — {entry['sample_count']} lines  "
-            f"(confidence {entry['confidence']:.0%})"
-        ):
-            st.code(entry["regex"], language="regex")
-            if "grok_pattern" in entry:
-                st.markdown("**Grok Pattern**")
-                st.code(entry["grok_pattern"])
-            if "kql_parse" in entry:
-                st.markdown("**KQL Parse**")
-                st.code(entry["kql_parse"], language="kql")
-            if "fortisiem_parser" in entry:
-                st.markdown("**FortiSIEM Parser**")
-                st.code(entry["fortisiem_parser"], language="xml")
-
-    # -- Exports --------------------------------------------------------
-    st.divider()
-    st.subheader("📦 Export")
-
-    col_csv, col_regex, col_json = st.columns(3)
-
-    with col_csv:
-        csv_buf = io.StringIO()
-        df.to_csv(csv_buf, index=False)
-        st.download_button(
-            "⬇️  Master CSV",
-            data=csv_buf.getvalue(),
-            file_name=f"log_harmonizer_{datetime.now():%Y%m%d_%H%M%S}.csv",
-            mime="text/csv",
-            use_container_width=True,
+        n_patterns = len(lib["patterns"])
+        st.markdown(
+            f"Upload files for parsing. **{n_patterns} pattern(s)** in library — "
+            f"matching logs will be parsed **locally with zero API calls**."
         )
 
-    with col_regex:
-        manifest_text = json.dumps(regex_manifest, indent=2)
-        st.download_button(
-            "⬇️  Regex Manifest (JSON)",
-            data=manifest_text,
-            file_name=f"regex_manifest_{datetime.now():%Y%m%d_%H%M%S}.json",
-            mime="application/json",
-            use_container_width=True,
+        apply_files = st.file_uploader(
+            "Upload log files for parsing",
+            type=["txt", "log", "csv"],
+            accept_multiple_files=True,
+            key="apply_files",
+            help="Upload as many files as you need. Parsing is local.",
         )
 
-    with col_json:
-        all_json = json.dumps(results, indent=2, default=str)
-        st.download_button(
-            "⬇️  Full Parsed JSON",
-            data=all_json,
-            file_name=f"parsed_logs_{datetime.now():%Y%m%d_%H%M%S}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+        if not apply_files:
+            st.info("👆 Upload files to parse using your Pattern Library.")
+            st.stop()
+
+        # Ingest
+        apply_raw: list[str] = []
+        for uf in apply_files:
+            apply_raw.extend(stream_lines(uf))
+        apply_entries = reassemble_multiline(apply_raw)
+        apply_clusters = cluster_logs(apply_entries)
+
+        # Match stats
+        lib_fps = set(lib["patterns"].keys())
+        matched_fps = set(apply_clusters.keys()) & lib_fps
+        unmatched_fps = set(apply_clusters.keys()) - lib_fps
+        matched_lines = sum(len(apply_clusters[fp]) for fp in matched_fps)
+        unmatched_lines = sum(len(apply_clusters[fp]) for fp in unmatched_fps)
+
+        # Clear stale results on file change
+        file_sig = hashlib.md5(str(len(apply_raw)).encode()).hexdigest()
+        if st.session_state.get("_apply_sig") != file_sig:
+            st.session_state.pop("apply_results", None)
+            st.session_state["_apply_sig"] = file_sig
+
+        col_a1, col_a2, col_a3, col_a4 = st.columns(4)
+        col_a1.metric("Log Entries", f"{len(apply_entries):,}")
+        col_a2.metric("Patterns Found", len(apply_clusters))
+        col_a3.metric("✅ Library Match", f"{matched_lines:,} lines")
+        col_a4.metric("❌ Unmatched", f"{unmatched_lines:,} lines")
+
+        if unmatched_fps:
+            st.warning(
+                f"{len(unmatched_fps)} pattern(s) not in library "
+                f"({unmatched_lines:,} lines). Go to the **Learn** tab to teach them."
+            )
+
+        if st.button("⚡ Parse with Library", type="primary", use_container_width=True):
+            progress = st.progress(0, text="Parsing locally…")
+            start = time.time()
+
+            def _update(done, total):
+                progress.progress(done / total, text=f"Parsing {done}/{total} clusters…")
+
+            results, regex_manifest, warnings, unmatched = apply_library_to_entries(
+                library=lib,
+                clusters=apply_clusters,
+                progress_callback=_update,
+            )
+
+            elapsed = time.time() - start
+            progress.empty()
+
+            for w in warnings:
+                st.warning(w)
+
+            if not results:
+                st.error("No results. All patterns may be unmatched.")
+                st.stop()
+
+            st.toast(f"Parsed {len(results):,} entries in {elapsed:.1f}s — 0 API calls!", icon="⚡")
+
+            st.session_state["apply_results"] = results
+            st.session_state["apply_manifest"] = regex_manifest
+            st.session_state["apply_elapsed"] = elapsed
+            st.rerun()
+
+        # -- Display Results -------------------------------------------
+        if "apply_results" not in st.session_state:
+            st.stop()
+
+        results = st.session_state["apply_results"]
+        regex_manifest = st.session_state.get("apply_manifest", [])
+        elapsed = st.session_state.get("apply_elapsed", 0)
+
+        st.divider()
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Parsed Lines", f"{len(results):,}")
+        col_m2.metric("Pattern Classes", len(regex_manifest))
+        col_m3.metric("Processing Time", f"{elapsed:.1f}s")
+        col_m4.metric("API Calls", "0")
+
+        st.subheader("📊 Parsed Results")
+
+        df = pd.DataFrame(results)
+        col_order = ["_raw", "_cluster_id", "_confidence", "_source"] + [
+            c for c in df.columns if not c.startswith("_")
+        ]
+        df = df[[c for c in col_order if c in df.columns]]
+
+        tab_table, tab_raw = st.tabs(["Structured Table", "Raw vs. Parsed"])
+        with tab_table:
+            st.dataframe(df, use_container_width=True, height=400)
+        with tab_raw:
+            if results:
+                sample_idx = st.slider("Select row", 0, len(results) - 1, 0, key="apply_slider")
+                row = results[sample_idx]
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Raw Log**")
+                    raw_display = row.get("_raw", "").replace("  |  ", "\n    ")
+                    st.code(raw_display, language="log")
+                with c2:
+                    st.markdown("**Parsed JSON**")
+                    display = {k: v for k, v in row.items() if not k.startswith("_")}
+                    st.json(display)
+
+        # Regex Manifest
+        st.divider()
+        st.subheader("🧩 Regex / SIEM Manifest")
+        for entry in regex_manifest:
+            with st.expander(
+                f"Cluster `{entry['cluster_id']}` — {entry['sample_count']} lines  "
+                f"(confidence {entry.get('confidence', 0):.0%})"
+            ):
+                st.code(entry.get("regex", ""), language="regex")
+                if "grok_pattern" in entry:
+                    st.markdown("**Grok Pattern**")
+                    st.code(entry["grok_pattern"])
+                if "kql_parse" in entry:
+                    st.markdown("**KQL Parse**")
+                    st.code(entry["kql_parse"], language="kql")
+                if "fortisiem_parser" in entry:
+                    st.markdown("**FortiSIEM Parser**")
+                    st.code(entry["fortisiem_parser"], language="xml")
+
+        # Exports
+        st.divider()
+        st.subheader("📦 Export")
+        col_csv, col_regex, col_json = st.columns(3)
+
+        with col_csv:
+            csv_buf = io.StringIO()
+            df.to_csv(csv_buf, index=False)
+            st.download_button(
+                "⬇️ Master CSV", data=csv_buf.getvalue(),
+                file_name=f"log_harmonizer_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                mime="text/csv", use_container_width=True,
+            )
+        with col_regex:
+            st.download_button(
+                "⬇️ Regex Manifest",
+                data=json.dumps(regex_manifest, indent=2),
+                file_name=f"regex_manifest_{datetime.now():%Y%m%d_%H%M%S}.json",
+                mime="application/json", use_container_width=True,
+            )
+        with col_json:
+            st.download_button(
+                "⬇️ Full Parsed JSON",
+                data=json.dumps(results, indent=2, default=str),
+                file_name=f"parsed_logs_{datetime.now():%Y%m%d_%H%M%S}.json",
+                mime="application/json", use_container_width=True,
+            )
 
 
 if __name__ == "__main__":
